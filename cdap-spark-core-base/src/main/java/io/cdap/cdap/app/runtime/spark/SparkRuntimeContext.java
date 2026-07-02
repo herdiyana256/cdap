@@ -45,12 +45,18 @@ import io.cdap.cdap.messaging.spi.MessagingService;
 import io.cdap.cdap.security.spi.authentication.AuthenticationContext;
 import io.cdap.cdap.security.spi.authorization.AccessEnforcer;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.spark.TaskContext;
+import org.apache.spark.util.TaskFailureListener;
 import org.apache.tephra.TransactionSystemClient;
 import org.apache.twill.api.ServiceAnnouncer;
 import org.apache.twill.filesystem.LocationFactory;
 
 import java.io.Closeable;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import javax.annotation.Nullable;
 
 /**
@@ -112,35 +118,120 @@ public final class SparkRuntimeContext extends AbstractContext implements Metric
     this.closeable = closeable;
   }
 
+  private static final List<String> TARGET_METRIC_SUFFIXES = Arrays.asList(
+      Constants.Metrics.RECORDS_IN_SUFFIX,
+      Constants.Metrics.RECORDS_OUT_SUFFIX,
+      Constants.Metrics.RECORDS_ERROR_SUFFIX,
+      Constants.Metrics.RECORDS_ALERT_SUFFIX
+  );
+
+  private final ThreadLocal<Map<String, Long>> bufferedCounts = ThreadLocal.withInitial(HashMap::new);
+  private final ThreadLocal<Boolean> listenerRegistered = ThreadLocal.withInitial(() -> false);
+  private final ThreadLocal<Boolean> taskFailed = ThreadLocal.withInitial(() -> false);
+
   @Override
   public void close() {
     super.close();
     Closeables.closeQuietly(closeable);
   }
 
+  private Metrics getTaskMetrics() {
+    TaskContext tc = TaskContext.get();
+    if (tc != null) {
+      Map<String, String> taskTags = new HashMap<>();
+      taskTags.put(Constants.Metrics.Tag.SPARK_PARTITION, String.valueOf(tc.partitionId()));
+      taskTags.put(Constants.Metrics.Tag.SPARK_ATTEMPT, String.valueOf(tc.attemptNumber()));
+      return getMetrics().child(taskTags);
+    }
+    return getMetrics();
+  }
+
   @Override
   public void count(String metricName, int delta) {
     getMetrics().count(metricName, delta);
+    bufferMetric(metricName, delta, false);
   }
 
   @Override
   public void countLong(String metricName, long delta) {
     getMetrics().countLong(metricName, delta);
+    bufferMetric(metricName, delta, false);
   }
 
   @Override
   public void gauge(String metricName, long value) {
     getMetrics().gauge(metricName, value);
+    bufferMetric(metricName, value, true);
+  }
+
+  private void bufferMetric(String metricName, long value, boolean isGauge) {
+    TaskContext tc = TaskContext.get();
+    if (tc == null) {
+      return;
+    }
+    boolean isTarget = false;
+    for (String suffix : TARGET_METRIC_SUFFIXES) {
+      if (metricName.endsWith(suffix)) {
+        isTarget = true;
+        break;
+      }
+    }
+    if (!isTarget) {
+      return;
+    }
+    registerCompletionListenerIfNeeded(tc);
+    Map<String, Long> buffer = bufferedCounts.get();
+    if (isGauge) {
+      buffer.put(metricName, value);
+    } else {
+      buffer.put(metricName, buffer.getOrDefault(metricName, 0L) + value);
+    }
+  }
+
+  private void registerCompletionListenerIfNeeded(TaskContext tc) {
+    if (!listenerRegistered.get()) {
+      tc.addTaskFailureListener((context, error) -> {
+        taskFailed.set(true);
+      });
+      tc.addTaskCompletionListener(context -> {
+        try {
+          if (!taskFailed.get() && !context.isInterrupted()) {
+            flushBufferedMetrics();
+          }
+        } finally {
+          clearBufferedMetrics();
+        }
+      });
+      listenerRegistered.set(true);
+    }
+  }
+
+  private void flushBufferedMetrics() {
+    Map<String, Long> buffer = bufferedCounts.get();
+    if (buffer.isEmpty()) {
+      return;
+    }
+    Metrics taskMetrics = getTaskMetrics();
+    for (Map.Entry<String, Long> entry : buffer.entrySet()) {
+      String rawMetricName = entry.getKey() + Constants.Metrics.RAW_SUFFIX;
+      taskMetrics.countLong(rawMetricName, entry.getValue());
+    }
+  }
+
+  private void clearBufferedMetrics() {
+    bufferedCounts.remove();
+    listenerRegistered.remove();
+    taskFailed.remove();
   }
 
   @Override
   public Metrics child(Map<String, String> tags) {
-    return getMetrics().child(tags);
+    return getTaskMetrics().child(tags);
   }
 
   @Override
   public Map<String, String> getTags() {
-    return getMetrics().getTags();
+    return getTaskMetrics().getTags();
   }
 
   /**
